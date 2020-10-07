@@ -1,95 +1,98 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-#
-# Copyright (c) 2016-present, Facebook, Inc.
-# All rights reserved.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-import numpy as np
-from scipy import stats
+import functools
 import os
-import math
-import argparse
+import tensorflow.compat.v1 as tf
+from tensorflow.python.util.deprecation import deprecated
+from object_detection.builders import dataset_builder
+from object_detection.builders import graph_rewriter_builder
+from object_detection.builders import model_builder
+from object_detection.legacy import evaluator
+from object_detection.utils import config_util
+from object_detection.utils import label_map_util
+
+tf.logging.set_verbosity(tf.logging.INFO)
+
+flags = tf.app.flags
+flags.DEFINE_boolean('eval_training_data', False,
+                     'If training data should be evaluated for this job.')
+flags.DEFINE_string(
+    'checkpoint_dir', '',
+    'Directory containing checkpoints to evaluate, typically '
+    'set to `train_dir` used in the training job.')
+flags.DEFINE_string('eval_dir', '', 'Directory to write eval summaries to.')
+flags.DEFINE_string(
+    'pipeline_config_path', '',
+    'Path to a pipeline_pb2.TrainEvalPipelineConfig config '
+    'file. If provided, other configs are ignored')
+flags.DEFINE_string('eval_config_path', '',
+                    'Path to an eval_pb2.EvalConfig config file.')
+flags.DEFINE_string('input_config_path', '',
+                    'Path to an input_reader_pb2.InputReader config file.')
+flags.DEFINE_string('model_config_path', '',
+                    'Path to a model_pb2.DetectionModel config file.')
+flags.DEFINE_boolean(
+    'run_once', False, 'Option to only run a single pass of '
+    'evaluation. Overrides the `max_evals` parameter in the '
+    'provided config.')
+FLAGS = flags.FLAGS
 
 
-def compat_splitting(line):
-    return line.decode('utf8').split()
+@deprecated(None, 'Use object_detection/model_main.py.')
+def main(unused_argv):
+  assert FLAGS.checkpoint_dir, '`checkpoint_dir` is missing.'
+  assert FLAGS.eval_dir, '`eval_dir` is missing.'
+  tf.gfile.MakeDirs(FLAGS.eval_dir)
+  if FLAGS.pipeline_config_path:
+    configs = config_util.get_configs_from_pipeline_file(
+        FLAGS.pipeline_config_path)
+    tf.gfile.Copy(
+        FLAGS.pipeline_config_path,
+        os.path.join(FLAGS.eval_dir, 'pipeline.config'),
+        overwrite=True)
+  else:
+    configs = config_util.get_configs_from_multiple_files(
+        model_config_path=FLAGS.model_config_path,
+        eval_config_path=FLAGS.eval_config_path,
+        eval_input_config_path=FLAGS.input_config_path)
+    for name, config in [('model.config', FLAGS.model_config_path),
+                         ('eval.config', FLAGS.eval_config_path),
+                         ('input.config', FLAGS.input_config_path)]:
+      tf.gfile.Copy(config, os.path.join(FLAGS.eval_dir, name), overwrite=True)
+
+  model_config = configs['model']
+  eval_config = configs['eval_config']
+  input_config = configs['eval_input_config']
+  if FLAGS.eval_training_data:
+    input_config = configs['train_input_config']
+
+  model_fn = functools.partial(
+      model_builder.build, model_config=model_config, is_training=False)
+
+  def get_next(config):
+    return dataset_builder.make_initializable_iterator(
+        dataset_builder.build(config)).get_next()
+
+  create_input_dict_fn = functools.partial(get_next, input_config)
+
+  categories = label_map_util.create_categories_from_labelmap(
+      input_config.label_map_path)
+
+  if FLAGS.run_once:
+    eval_config.max_evals = 1
+
+  graph_rewriter_fn = None
+  if 'graph_rewriter_config' in configs:
+    graph_rewriter_fn = graph_rewriter_builder.build(
+        configs['graph_rewriter_config'], is_training=False)
+
+  evaluator.evaluate(
+      create_input_dict_fn,
+      model_fn,
+      eval_config,
+      categories,
+      FLAGS.checkpoint_dir,
+      FLAGS.eval_dir,
+      graph_hook_fn=graph_rewriter_fn)
 
 
-def similarity(v1, v2):
-    n1 = np.linalg.norm(v1)
-    n2 = np.linalg.norm(v2)
-    return np.dot(v1, v2) / n1 / n2
-
-
-parser = argparse.ArgumentParser(description='Process some integers.')
-parser.add_argument(
-    '--model',
-    '-m',
-    dest='modelPath',
-    action='store',
-    required=True,
-    help='path to model'
-)
-parser.add_argument(
-    '--data',
-    '-d',
-    dest='dataPath',
-    action='store',
-    required=True,
-    help='path to data'
-)
-args = parser.parse_args()
-
-vectors = {}
-fin = open(args.modelPath, 'rb')
-for _, line in enumerate(fin):
-    try:
-        tab = compat_splitting(line)
-        vec = np.array(tab[1:], dtype=float)
-        word = tab[0]
-        if np.linalg.norm(vec) == 0:
-            continue
-        if not word in vectors:
-            vectors[word] = vec
-    except ValueError:
-        continue
-    except UnicodeDecodeError:
-        continue
-fin.close()
-
-mysim = []
-gold = []
-drop = 0.0
-nwords = 0.0
-
-fin = open(args.dataPath, 'rb')
-for line in fin:
-    tline = compat_splitting(line)
-    word1 = tline[0].lower()
-    word2 = tline[1].lower()
-    nwords = nwords + 1.0
-
-    if (word1 in vectors) and (word2 in vectors):
-        v1 = vectors[word1]
-        v2 = vectors[word2]
-        d = similarity(v1, v2)
-        mysim.append(d)
-        gold.append(float(tline[2]))
-    else:
-        drop = drop + 1.0
-fin.close()
-
-corr = stats.spearmanr(mysim, gold)
-dataset = os.path.basename(args.dataPath)
-print(
-    "{0:20s}: {1:2.0f}  (OOV: {2:2.0f}%)"
-    .format(dataset, corr[0] * 100, math.ceil(drop / nwords * 100.0))
-)
+if __name__ == '__main__':
+  tf.app.run()
